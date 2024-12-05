@@ -1,0 +1,114 @@
+-- Enable NOCOUNT for clean output
+SET NOCOUNT ON;
+
+-- Variables for Server Properties
+DECLARE @ver NVARCHAR(128);
+DECLARE @edition VARCHAR(128);
+DECLARE @prodlvl VARCHAR(128);
+DECLARE @subver NVARCHAR(128);
+DECLARE @physicalmemory DECIMAL(7,1);
+DECLARE @sqltext NVARCHAR(4000);
+DECLARE @rgedition INTEGER;
+DECLARE @rgversion VARCHAR(16);
+DECLARE @rgserialnumber VARCHAR(30);
+
+-- Fetch Server Properties
+SET @ver = CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(128));
+SET @edition = CAST(SERVERPROPERTY('edition') AS VARCHAR(128));
+SET @prodlvl = CAST(SERVERPROPERTY('productlevel') AS VARCHAR(128));
+SET @subver = SUBSTRING(@ver, CHARINDEX('.', @ver) + 1, 1);
+SET @ver = LEFT(@ver, CHARINDEX('.', @ver) - 1);
+
+-- Fetch Physical Memory Based on SQL Version
+IF CAST(@ver AS INT) >= 11 -- SQL 2012 or higher
+    SET @sqltext = 'SELECT @pm = CAST(ROUND(physical_memory_kb / 1024 / 1024.0 , 1) AS DECIMAL(7, 1)) FROM sys.dm_os_sys_info';
+ELSE -- Pre-SQL 2012
+    SET @sqltext = 'SELECT @pm = CAST(ROUND(physical_memory_in_bytes / 1024 / 1024 / 1024.0 , 1) AS DECIMAL(7, 1)) FROM sys.dm_os_sys_info';
+
+EXEC sp_executesql @sqltext, N'@pm DECIMAL(7,1) OUTPUT', @pm = @physicalmemory OUTPUT;
+
+-- Configuration Variables
+DECLARE @MaxDoP VARCHAR(2), @CostThresholdForParallelism VARCHAR(20);
+
+-- Fetch MaxDoP and Cost Threshold
+SELECT @MaxDoP = CAST(value_in_use AS VARCHAR(2))
+FROM sys.configurations
+WHERE name = 'max degree of parallelism';
+
+SELECT @CostThresholdForParallelism = CAST(value_in_use AS VARCHAR(20))
+FROM sys.configurations
+WHERE name = 'cost threshold for parallelism';
+
+-- Temporary Tables for CPU and Memory Details
+CREATE TABLE #CPUValues (
+    [index] SMALLINT,
+    [description] VARCHAR(128),
+    [server_cores] SMALLINT,
+    [value] VARCHAR(5)
+);
+
+CREATE TABLE #MemoryValues (
+    [index] SMALLINT,
+    [description] VARCHAR(128),
+    [server_memory] DECIMAL(10, 2),
+    [value] VARCHAR(64)
+);
+
+-- Insert CPU and Memory Information
+INSERT INTO #CPUValues EXEC xp_msver 'ProcessorCount';
+INSERT INTO #MemoryValues EXEC xp_msver 'PhysicalMemory';
+
+-- Server Services Information
+WITH ServiceInfo AS (
+    SELECT
+        @@SERVERNAME AS ServerName,
+        MIN(CASE WHEN LEFT(servicename, CHARINDEX(' (', servicename) - 1) = 'SQL Server' THEN is_clustered END) AS IsClustered,
+        MIN(CASE WHEN LEFT(servicename, CHARINDEX(' (', servicename) - 1) = 'SQL Server' THEN cluster_nodename END) AS ClusterNodeName,
+        MIN(CASE WHEN LEFT(servicename, CHARINDEX(' (', servicename) - 1) = 'SQL Server' THEN service_account END) AS SQLServerServiceAccount,
+        MIN(CASE WHEN LEFT(servicename, CHARINDEX(' (', servicename) - 1) = 'SQL Server' THEN startup_type_desc END) AS SQLServerStartupType,
+        MIN(CASE WHEN LEFT(servicename, CHARINDEX(' (', servicename) - 1) = 'SQL Server' THEN status_desc END) AS SQLServerStatus,
+        MIN(CASE WHEN LEFT(servicename, CHARINDEX(' (', servicename) - 1) = 'SQL Server Agent' THEN service_account END) AS SQLAgentServiceAccount,
+        MIN(CASE WHEN LEFT(servicename, CHARINDEX(' (', servicename) - 1) = 'SQL Server Agent' THEN startup_type_desc END) AS SQLAgentStartupType,
+        MIN(CASE WHEN LEFT(servicename, CHARINDEX(' (', servicename) - 1) = 'SQL Server Agent' THEN status_desc END) AS SQLAgentStatus
+    FROM sys.dm_server_services
+)
+-- Comprehensive Server Configuration Report
+SELECT 
+    SERVERPROPERTY('machinename') AS "Server",
+    ISNULL(SERVERPROPERTY('InstanceName'), 'MSSQLSERVER') AS "Instance",
+    (SELECT local_net_address FROM sys.dm_exec_connections WHERE session_id = @@SPID) AS "IP",
+    (SELECT local_tcp_port FROM sys.dm_exec_connections WHERE session_id = @@SPID) AS "Port",
+    CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(128)) AS "Version Number",
+    CASE @ver
+        WHEN '7' THEN '7'
+        WHEN '8' THEN '2000'
+        WHEN '9' THEN '2005'
+        WHEN '10' THEN '2008'
+        WHEN '11' THEN '2012'
+        WHEN '12' THEN '2014'
+        WHEN '13' THEN '2016'
+        WHEN '14' THEN '2017'
+        ELSE CAST(((CAST(@ver AS INT) - 14) * 2 + 2017) AS NVARCHAR(128)) + '?'
+    END + CASE @subver WHEN '5' THEN 'R2' ELSE '' END AS "Version",
+    LEFT(@edition, CHARINDEX(' ', @edition) - 1) AS "Edition",
+    REPLACE(REPLACE(@prodlvl, 'SP', ''), 'RTM', '0') AS "SP",
+    (SELECT COUNT(*) FROM sys.sysdatabases WHERE dbid > 4) AS "# of DBs",
+    (SELECT cpu_count FROM sys.dm_os_sys_info) AS "CPUs",
+    @physicalmemory AS "Mem(GB)",
+    (SELECT ROUND(CAST(value AS INT) / 1024.0, 1) FROM sys.configurations WHERE name LIKE 'max server memory%') AS "SQL Mem(GB)",
+    @@VERSION AS "Windows Version",
+    @MaxDoP AS "MaxDoP",
+    @CostThresholdForParallelism AS "CostThreshold",
+    ServiceInfo.IsClustered,
+    ServiceInfo.ClusterNodeName,
+    ServiceInfo.SQLServerServiceAccount,
+    ServiceInfo.SQLServerStartupType,
+    ServiceInfo.SQLServerStatus,
+    ServiceInfo.SQLAgentServiceAccount,
+    ServiceInfo.SQLAgentStartupType,
+    ServiceInfo.SQLAgentStatus
+FROM ServiceInfo;
+
+-- Cleanup Temporary Tables
+DROP TABLE #CPUValues;
+DROP TABLE #MemoryValues;
